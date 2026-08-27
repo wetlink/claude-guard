@@ -747,54 +747,108 @@ check_model_policy() {
   done
 }
 
-# Schannel（Windows 原生 TLS 后端）既不打印 "SSL certificate verify ok"，也不打印证书
-# issuer，下面基于 curl verbose 输出的证书检查在它上面无法执行。放宽字符串匹配并不能
-# 恢复检查，只会把这一步变成什么都不查的空步骤，因此直接判定为平台不支持。
-tls_backend_lacks_cert_details() {
+# Some Schannel builds expose certificate metadata through %{certs}; older builds expose
+# neither that structured data nor a legacy verbose issuer. Keep backend detection separate
+# so the latter can fail with a capability-specific message instead of silently degrading.
+tls_backend_is_schannel() {
   printf '%s\n' "$1" | grep -qi '^\* schannel'
+}
+
+TLS_PROBE_OUT=''
+TLS_PROBE_CERTS=''
+TLS_PROBE_ISSUER=''
+TLS_PROBE_REASON=''
+TLS_PROBE_UNSUPPORTED=0
+
+tls_probe_once() {
+  local host="$1"
+  local issuer curl_status certs_file
+
+  TLS_PROBE_OUT=''
+  TLS_PROBE_CERTS=''
+  TLS_PROBE_ISSUER=''
+  TLS_PROBE_REASON=''
+  TLS_PROBE_UNSUPPORTED=0
+
+  if ! certs_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/claude-guard-certs.XXXXXX")"; then
+    TLS_PROBE_REASON="无法创建 TLS 证书元数据临时文件"
+    return 1
+  fi
+
+  # Redirections are deliberately ordered left to right: verbose/error stderr stays in
+  # TLS_PROBE_OUT, while write-out stdout goes only to the private temporary file.
+  TLS_PROBE_OUT="$(official_net_env curl -q -4 -x "$CLAUDE_PROXY_URL" \
+      --cacert "$CA_CERT_FILE" -vI -o /dev/null \
+      --connect-timeout 8 --max-time 15 \
+      --write-out '%{certs}' \
+      "https://${host}/" 2>&1 >"$certs_file")" \
+    && curl_status=0 || curl_status=$?
+  TLS_PROBE_CERTS="$(<"$certs_file")"
+  rm -f -- "$certs_file"
+
+  if tls_backend_is_schannel "$TLS_PROBE_OUT" \
+      && printf '%s\n' "$TLS_PROBE_OUT" | grep -qi 'unknown.*write-out.*certs'; then
+    TLS_PROBE_UNSUPPORTED=1
+    TLS_PROBE_REASON="当前 curl 使用 Schannel（Windows 原生）TLS 后端，但不提供 %{certs} 证书元数据，无法对 ${host} 执行 TLS/MITM 校验。这是 curl 能力限制，不是代理或配置问题；解决办法见 README 的「平台支持」一节。"
+    return 1
+  fi
+
+  if [ "$curl_status" -ne 0 ]; then
+    TLS_PROBE_REASON="无法连接或验证 ${host} 的证书"
+    return 1
+  fi
+
+  if ! printf '%s\n' "$TLS_PROBE_OUT" |
+      grep -Eq "CONNECT ${host}:443|CONNECT tunnel established|CONNECT phase completed"; then
+    TLS_PROBE_REASON="${host} 没有走 ${CLAUDE_PROXY_URL} 的 HTTP CONNECT 隧道"
+    return 1
+  fi
+
+  issuer="$(printf '%s\n' "$TLS_PROBE_CERTS" |
+    sed -n 's/^Issuer:[[:space:]]*//p' | head -1)"
+  if [ -z "$issuer" ]; then
+    issuer="$(printf '%s\n' "$TLS_PROBE_OUT" |
+      sed -n 's/^\*[[:space:]]*[Ii]ssuer:[[:space:]]*//p' | head -1)"
+  fi
+  if [ -z "$issuer" ]; then
+    if tls_backend_is_schannel "$TLS_PROBE_OUT"; then
+      TLS_PROBE_UNSUPPORTED=1
+      TLS_PROBE_REASON="当前 curl 使用 Schannel（Windows 原生）TLS 后端，但不提供可读取的证书 issuer，无法对 ${host} 执行 TLS/MITM 校验。这是 curl 能力限制，不是代理或配置问题；解决办法见 README 的「平台支持」一节。"
+      return 1
+    fi
+    TLS_PROBE_REASON="无法读取 ${host} 的证书 issuer"
+    return 1
+  fi
+
+  case "$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')" in
+    *charles*|*mitm*|*fiddler*|*zscaler*|*clash*|*surge*|*proxy*)
+      TLS_PROBE_REASON="${host} 的证书 issuer 疑似代理/MITM: ${issuer}"
+      return 1
+      ;;
+  esac
+
+  TLS_PROBE_ISSUER="$issuer"
+  return 0
 }
 
 check_tls_host() {
   local host="$1"
   local mode="${2:-required}"
-  local out issuer reason attempt unsupported curl_status
+  local out issuer reason attempt unsupported
 
   attempt=1
   unsupported=0
   while [ "$attempt" -le "$TLS_CHECK_RETRIES" ]; do
-    reason=''
-    out="$(official_net_env curl -q -4 -x "$CLAUDE_PROXY_URL" --cacert "$CA_CERT_FILE" -vI --connect-timeout 8 --max-time 15 "https://${host}/" 2>&1 >/dev/null)" \
-      && curl_status=0 || curl_status=$?
-
-    # 后端识别必须先于退出码判定：Schannel 在证书校验失败时同样会以非零码退出，
-    # 那时报「无法连接或验证证书」会把一个平台限制说成网络或代理问题。
-    if tls_backend_lacks_cert_details "$out"; then
-      unsupported=1
-      reason="当前 curl 使用 Schannel（Windows 原生）TLS 后端，不输出证书验证结果和 issuer，无法对 ${host} 执行 TLS/MITM 校验。这是平台限制，不是代理或配置问题；解决办法见 README 的「平台支持」一节。"
-    elif [ "$curl_status" -ne 0 ]; then
-      reason="无法连接或验证 ${host} 的证书"
-    elif ! printf '%s\n' "$out" | grep -Eq "CONNECT ${host}:443|CONNECT tunnel established|CONNECT phase completed"; then
-      reason="${host} 没有走 ${CLAUDE_PROXY_URL} 的 HTTP CONNECT 隧道"
-    elif ! printf '%s\n' "$out" | grep -q 'SSL certificate verify ok'; then
-      reason="${host} 未显示证书验证通过"
-    else
-      issuer="$(printf '%s\n' "$out" | sed -n 's/.*issuer: //p' | head -1)"
-      if [ -z "$issuer" ]; then
-        reason="无法读取 ${host} 的证书 issuer"
-      else
-        case "$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')" in
-          *charles*|*mitm*|*fiddler*|*zscaler*|*clash*|*surge*|*proxy*)
-            reason="${host} 的证书 issuer 疑似代理/MITM: ${issuer}"
-            ;;
-          *)
-            ui_note 'TLS 预检通过：%s via %s issuer=%s' "$host" "$CLAUDE_PROXY_URL" "$issuer"
-            return 0
-            ;;
-        esac
-      fi
+    if tls_probe_once "$host"; then
+      issuer="$TLS_PROBE_ISSUER"
+      ui_note 'TLS 预检通过：%s via %s issuer=%s' "$host" "$CLAUDE_PROXY_URL" "$issuer"
+      return 0
     fi
+    reason="$TLS_PROBE_REASON"
+    out="$TLS_PROBE_OUT"
+    unsupported="$TLS_PROBE_UNSUPPORTED"
 
-    # 平台不支持是确定性结果，重试只会浪费时间。
+    # 缺少证书元数据是确定性的 curl 能力限制，重试只会浪费时间。
     [ "$unsupported" -eq 0 ] || break
 
     if [ "$attempt" -lt "$TLS_CHECK_RETRIES" ]; then
@@ -1509,19 +1563,7 @@ EOF
 }
 
 check_api_path_once() {
-  local out issuer
-
-  if ! out="$(official_net_env curl -q -4 -x "$CLAUDE_PROXY_URL" --cacert "$CA_CERT_FILE" -vI --connect-timeout 8 --max-time 15 https://api.anthropic.com/ 2>&1 >/dev/null)"; then
-    return 1
-  fi
-  printf '%s\n' "$out" | grep -Eq "CONNECT api.anthropic.com:443|CONNECT tunnel established|CONNECT phase completed" || return 1
-  printf '%s\n' "$out" | grep -q 'SSL certificate verify ok' || return 1
-  issuer="$(printf '%s\n' "$out" | sed -n 's/.*issuer: //p' | head -1)"
-  [ -n "$issuer" ] || return 1
-  case "$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')" in
-    *charles*|*mitm*|*fiddler*|*zscaler*|*clash*|*surge*|*proxy*) return 1 ;;
-  esac
-  return 0
+  tls_probe_once api.anthropic.com
 }
 
 watchdog_log() {

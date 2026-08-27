@@ -121,15 +121,19 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 | --- | --- | --- |
 | macOS | 已验证 | 开发与回归测试环境 |
 | Linux | 预期可用 | 需要把 `CLAUDE_GUARD_CA_CERT` 指向本机 CA bundle，默认值 `/etc/ssl/cert.pem` 是 macOS 路径 |
-| Windows（原生） | 不支持 | 见下 |
+| Windows（原生） | 条件支持 | curl 必须通过 `%{certs}` 提供证书 issuer；否则保持 fail-closed，见下 |
 
-Windows 原生 curl（以及任何使用 Schannel TLS 后端的 curl）跑不了启动门禁的 TLS 检查。
-原因不是某个字符串没匹配上：`check_tls_host` 要从 curl 的 verbose 输出里读出证书的
-`issuer:`，再拿它匹配 Charles、Fiddler、Zscaler 这类 MITM 特征——TLS 预检存在的理由就是
-这个检查。Schannel 既不打印 `SSL certificate verify ok`，也不打印 `issuer:`，所以放宽匹配
-并不能恢复检查，只会把这一步变成什么都不查的空步骤。因此这里选择明确报错，不做静默降级。
+Windows 原生 curl 通常使用 Schannel TLS 后端，不打印 OpenSSL verbose 输出里的
+`SSL certificate verify ok`。新版 curl 可以通过 `%{certs}` 提供结构化证书元数据；Guard 在
+curl 以 `-q` 禁用外部配置、显式使用固定 `--cacert` 且退出码为 0 后，仍要求 CONNECT 隧道
+证据、可读取的叶证书 issuer，以及原有的 MITM issuer 黑名单检查。任一条件缺失都不会放行。
 
-判断方法：`curl -V`，第一行末尾会写 SSL 后端。如果是 `Schannel`，有两条路：
+Schannel 在能够通过 `%{certs}` 提供 issuer 时可执行完整门禁；如果 curl 已成功完成握手却
+仍没有结构化 issuer 或 legacy verbose `issuer:`，Guard 会明确报 Schannel 能力不兼容并
+保持 fail-closed，不会跳过 TLS/MITM 检查。curl 非零退出仍按连接或证书校验失败处理并
+保留既定重试，不会仅因该次输出没有 issuer 就误报为确定性不兼容。
+
+诊断时可运行 `curl -V` 查看 TLS 后端。如果当前构建无法提供证书元数据，有两条回退路径：
 
 **1）改用 OpenSSL 编译的 curl。** 一律**以 `curl -V` 的实际输出为准**，不要按二进制的
 来源推断：社区反馈 Git for Windows 自带的 `mingw64\bin\curl.exe` 在部分版本上同样是
