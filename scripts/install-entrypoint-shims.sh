@@ -31,6 +31,13 @@ install_shim() {
 
 mkdir -p "$BIN_DIR"
 manifest_init "$MANIFEST"
+# 坏 manifest 必须在动任何文件之前就拦住。否则安装照常覆盖入口、坏记录继续留着，
+# 直到卸载时才发现恢复不回去——那时入口已经被接管了。
+validate_manifest "$MANIFEST" "$BIN_DIR" || {
+  printf '已有的安装记录未通过校验，拒绝安装: %s\n' "$MANIFEST" >&2
+  printf '请先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
+  exit 14
+}
 
 manifest_record "$MANIFEST" claude-guard "$GUARD_TARGET" binary "$PROJECT_VERSION" \
   "$ROOT_DIR/bin/claude-guard"

@@ -175,12 +175,56 @@ validate_manifest "$CANDIDATE" "$BIN_DIR" || fail_closed "指认备份后的安�
 
 # ---- 第一遍：只校验，不动文件。全部通过之后才进入第二遍执行 ----
 
+# 这个 entry 当前是否已经等于记录里的原始状态。上一次卸载被打断后重跑时，前面
+# 已恢复的 entry 会落在这个分支，否则重试会把它们当成「用户手工改过」而卡死。
+# 读 $ACTIVE_MANIFEST 而不是 $CANDIDATE：候选在执行阶段开始前就被 mv 成正式
+# manifest 了，继续读候选会在 apply 模式下拿不到文件，这条分支就永远不成立。
+entry_already_restored() {
+  local name="$1" path="$2"
+  local state
+
+  state="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.state)"
+  case "$state" in
+    absent)
+      [ ! -e "$path" ] && [ ! -L "$path" ]
+      ;;
+    symlink|dangling-symlink)
+      [ -L "$path" ] &&
+        [ "$(readlink "$path")" = "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.symlink_target)" ]
+      ;;
+    file)
+      [ -f "$path" ] && [ ! -L "$path" ] &&
+        [ "$(sha256_file "$path")" = "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.sha256)" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# 只验证这个 mode 在本平台上 chmod 能接受，绝不碰用户的文件。
+# 上一版直接对真实备份 chmod，结果 --dry-run 会把备份权限从 755 改成 600，备份路径
+# 若是 symlink 还会顺着改到外部文件上——「预演」本身成了副作用。
+mode_is_applicable() {
+  local mode="$1"
+  local probe
+
+  probe="$(mktemp)" || return 1
+  if chmod "$mode" "$probe" 2>/dev/null; then
+    rm -f "$probe"
+    return 0
+  fi
+  rm -f "$probe"
+  return 1
+}
+
 check_entry() {
   local name="$1"
-  local path state recorded_sha current_sha backup backup_sha
+  local path artifact state recorded_sha current_sha backup backup_sha
 
   path="$(manifest_entry_field "$CANDIDATE" "$name" path)"
   [ -n "$path" ] || fail_closed "安装记录里的条目缺少 path: $name"
+  artifact="$(manifest_entry_field "$CANDIDATE" "$name" artifact)"
 
   recorded_sha="$(manifest_entry_field "$CANDIDATE" "$name" artifact_sha256)"
   case "$(entry_state "$path")" in
@@ -188,15 +232,23 @@ check_entry() {
       # 入口已经不在了，恢复时按 original 处理即可，这里没有可校验的对象。
       ;;
     symlink|dangling-symlink)
-      fail_closed "当前入口是 symlink，不是我们安装的内容，拒绝改动: $path"
+      entry_already_restored "$name" "$path" ||
+        fail_closed "当前入口是 symlink，不是我们安装的内容，拒绝改动: $path"
       ;;
     file)
       current_sha="$(sha256_file "$path")" || exit 14
-      # 严格版判定：只接受指向本前缀 claude-guard 的 shim。用宽松版会把指向别处
-      # guard 的 shim 也当成「我们装的、可以覆盖」，那是别人的入口。
-      if [ "$current_sha" != "$recorded_sha" ] &&
-         ! is_guard_shim_for "$path" "$BIN_DIR/claude-guard"; then
-        fail_closed "当前入口既不是安装时的内容也不是本前缀的 Guard shim，可能已被手工修改，拒绝改动: $path"
+      if [ "$current_sha" = "$recorded_sha" ]; then
+        :
+      elif entry_already_restored "$name" "$path"; then
+        # 上一次卸载在这个 entry 之后被打断，这一份已经是恢复好的原件，允许重跑。
+        :
+      elif [ "$artifact" = shim ] &&
+           is_guard_shim_for "$path" "$BIN_DIR/claude-guard"; then
+        # 严格版判定，且只对 shim 类入口开放。binary 类（claude-guard / claude-cc）
+        # 只认记录摘要——否则把 claude-guard 换成一个合法 shim 就能骗过卸载器。
+        :
+      else
+        fail_closed "当前入口既不是安装时的内容也不是可识别的已恢复状态，可能已被手工修改，拒绝改动: $path"
       fi
       ;;
   esac
@@ -206,7 +258,14 @@ check_entry() {
 
   backup="$(manifest_entry_field "$CANDIDATE" "$name" original.backup_path)"
   [ -n "$backup" ] || fail_closed "安装记录声明有备份却没有 backup_path: $name"
-  [ -f "$backup" ] || fail_closed "安装记录指向的备份不存在: $backup"
+  # 备份必须是普通文件而不是 symlink：顺着 symlink 写会改到前缀之外的文件上。
+  if [ -L "$backup" ] || [ ! -f "$backup" ]; then
+    if entry_already_restored "$name" "$path"; then
+      # 重跑场景：这个 entry 已经恢复过，备份也已经被回收，属于正常。
+      return 0
+    fi
+    fail_closed "安装记录指向的备份不存在或不是普通文件: $backup"
+  fi
   # 这一条正是 issue #15 留下的现场：备份文件里躺着的是 Guard shim。
   if is_guard_shim "$backup"; then
     fail_closed "备份内容是 Guard shim 而不是原始入口，拒绝用它覆盖: $backup"
@@ -215,10 +274,8 @@ check_entry() {
   if [ "$backup_sha" != "$(manifest_entry_field "$CANDIDATE" "$name" original.sha256)" ]; then
     fail_closed "备份内容与安装时记录的摘要不符: $backup"
   fi
-  # mode 的格式已由 validate_manifest 把住，这里再确认它对 chmod 确实可用——第二遍
-  # 里一个失败的 chmod 就会留下「恢复一半」，那是文档明确承诺不会出现的状态。
-  chmod "$(manifest_entry_field "$CANDIDATE" "$name" original.mode)" "$backup" ||
-    fail_closed "安装记录里的 original.mode 无法应用: $name"
+  mode_is_applicable "$(manifest_entry_field "$CANDIDATE" "$name" original.mode)" ||
+    fail_closed "安装记录里的 original.mode 在本平台无法应用: $name"
 }
 
 names="$(jq -r '.entries[].name' "$CANDIDATE")"
@@ -239,13 +296,25 @@ act() {
   return 1
 }
 
+# 每个 entry 的替换都先在同目录写 staging，再 mv 原子换上去。跨 entry 做不到全局
+# 原子，但至少单个入口不会停在半写状态，而且整体可以安全重跑：已恢复的 entry 会被
+# entry_already_restored 认出来并跳过。
+#
+# 顺序上 claude-guard 排到最后：shim 指向它，先删 guard 会让还没恢复的 shim 变成
+# 指向不存在文件的死入口。
 restore_entry() {
   local name="$1"
-  local path state target backup mode
+  local path state target backup mode staging
 
   path="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" path)"
   state="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.state)"
 
+  if [ "$DRY_RUN" -eq 0 ] && entry_already_restored "$name" "$path"; then
+    printf '已是原始状态，跳过: %s\n' "$path"
+    return 0
+  fi
+
+  staging="$path.claude-guard-restore.$$"
   case "$state" in
     absent)
       if act "移除 $path"; then return 0; fi
@@ -255,10 +324,11 @@ restore_entry() {
     symlink|dangling-symlink)
       target="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.symlink_target)"
       if act "把 $path 恢复为指向 $target 的 symlink"; then return 0; fi
-      rm -f "$path"
       # 必须用 ln -s 重建。当初就是因为 cp -p 会把 symlink 展平成普通文件，才改成
       # 只在 manifest 里记 target。悬空 symlink 同样能这样重建。
-      ln -s "$target" "$path"
+      rm -f "$staging"
+      ln -s "$target" "$staging" || fail_closed "无法创建 symlink: $staging"
+      mv "$staging" "$path" || { rm -f "$staging"; fail_closed "无法就位: $path"; }
       printf '已恢复 symlink: %s -> %s\n' "$path" "$target"
       ;;
     file)
@@ -267,19 +337,34 @@ restore_entry() {
       # ${path} 的花括号不能省：bash 3.2 会把紧随其后的全角字符的首字节吞进变量名，
       # 于是 set -u 报 "path?: unbound variable"。bash 5 下没有这个问题。
       if act "用 $backup 恢复 ${path}（权限 ${mode}）"; then return 0; fi
-      cp -p "$backup" "$path"
-      chmod "$mode" "$path"
-      # 只回收我们自己创建的备份。--adopt-backup 指认的是用户既有的文件，恢复完也
-      # 留着——「不自动删除历史备份」对显式指认的那一份同样成立。
-      if [ "$backup" = "$(backup_path_for "$path")" ]; then
-        rm -f "$backup"
-      fi
+      rm -f "$staging"
+      cp -p "$backup" "$staging" || { rm -f "$staging"; fail_closed "无法写入暂存文件: $staging"; }
+      chmod "$mode" "$staging" || { rm -f "$staging"; fail_closed "无法设置权限: $staging"; }
+      mv "$staging" "$path" || { rm -f "$staging"; fail_closed "无法就位: $path"; }
       printf '已恢复: %s\n' "$path"
       ;;
     *)
       fail_closed "安装记录里的 original.state 不可识别: $name=${state:-empty}"
       ;;
   esac
+}
+
+# 备份统一在所有 entry 都成功之后再回收。中途失败时备份必须还在，否则重跑就没有
+# 可用的原件了。只回收我们自己创建的那一份——--adopt-backup 指认的是用户既有的
+# 文件，「不自动删除历史备份」对它同样成立。
+reclaim_backups() {
+  local name path backup
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    path="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" path)"
+    [ "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.state)" = file ] || continue
+    backup="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_path)"
+    [ "$backup" = "$(backup_path_for "$path")" ] || continue
+    rm -f "$backup"
+  done <<INNER
+$names
+INNER
 }
 
 # 全部校验通过，这里是唯一的提交点。dry-run 不提交，候选由 EXIT trap 清掉。
@@ -290,12 +375,27 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 printf '前缀: %s\n' "$PREFIX"
+# claude-guard 排到最后。shim 指向它，先删 guard 会把还没恢复的 shim 变成指向不存在
+# 文件的死入口——那正是「恢复一半」里最难收拾的形态。
 while IFS= read -r name; do
   [ -n "$name" ] || continue
+  [ "$name" = claude-guard ] && continue
   restore_entry "$name"
 done <<EOF
 $names
 EOF
+while IFS= read -r name; do
+  [ "$name" = claude-guard ] || continue
+  restore_entry "$name"
+done <<EOF
+$names
+EOF
+
+# 到这里所有 entry 都已就位，备份才可以回收。中途失败时它们必须还在，否则重跑就没有
+# 可用的原件了。
+if [ "$DRY_RUN" -eq 0 ]; then
+  reclaim_backups
+fi
 
 if act "删除安装记录 $MANIFEST"; then
   :
