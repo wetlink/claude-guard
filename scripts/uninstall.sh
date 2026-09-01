@@ -36,9 +36,18 @@ usage() {
   printf '环境变量 CLAUDE_GUARD_PREFIX 决定操作哪个前缀，默认 $HOME/.local。\n'
 }
 
+# 失败文案必须分阶段。第一遍确实一个文件都没碰；进入第二遍之后再说「未做任何修改」
+# 就是不实陈述，会让用户按错误的现场去判断。
+PHASE=precheck
+
 fail_closed() {
   printf '%s\n' "$1" >&2
-  printf '未做任何修改。先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
+  if [ "$PHASE" = precheck ]; then
+    printf '未做任何修改。先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
+  else
+    printf '部分入口可能已经恢复。安装记录与备份都已保留，修复上述问题后可以直接重跑\n' >&2
+    printf 'scripts/uninstall.sh——已经恢复好的入口会被识别并跳过。\n' >&2
+  fi
   exit 14
 }
 
@@ -157,7 +166,8 @@ adopt_backup() {
   jq --arg n "$name" --arg b "$backup" --arg d "$digest" --arg m "$mode" \
     '.entries |= map(
        if .name == $n
-       then .original = {state: "file", sha256: $d, mode: $m, backup_path: $b}
+       then .original = {state: "file", sha256: $d, mode: $m, backup_path: $b,
+                         backup_origin: "adopted"}
        else . end)' "$CANDIDATE" >"$tmp"
   mv "$tmp" "$CANDIDATE"
   printf '已指认备份: %s -> %s\n' "$name" "$backup"
@@ -359,8 +369,11 @@ reclaim_backups() {
     [ -n "$name" ] || continue
     path="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" path)"
     [ "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.state)" = file ] || continue
+    # 只回收 managed。adopted 是用户显式指认的既有文件，哪怕它恰好躺在固定备份
+    # 路径上也不删——「谁拥有这份备份」由记录说了算，不由文件名推断。
+    [ "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_origin)" = managed ] ||
+      continue
     backup="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_path)"
-    [ "$backup" = "$(backup_path_for "$path")" ] || continue
     rm -f "$backup"
   done <<INNER
 $names
@@ -372,6 +385,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   mv "$CANDIDATE" "$MANIFEST" || fail_closed "无法提交安装记录: $MANIFEST"
   trap - EXIT
   ACTIVE_MANIFEST="$MANIFEST"
+  PHASE=execute
 fi
 
 printf '前缀: %s\n' "$PREFIX"

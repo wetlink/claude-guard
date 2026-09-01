@@ -302,18 +302,40 @@ do_uninstall --dry-run || fail '用例 20: dry-run 退出码非零' "$PREFIX/uni
 [ "$(file_mode "$PREFIX/bin/claude.claude-guard-backup")" = "755" ] ||
   fail '用例 20: dry-run 改动了真实备份的权限位'
 
-# --- 21. 备份路径是 symlink 时必须拒绝，绝不能顺着写到前缀之外 ---
+# --- 21. 卸载侧：固定备份路径变成 symlink 时必须拒绝 ---
+# 关键在于外部目标的内容与记录里的原备份**完全相同**，只有 mode 不同。这样摘要检查
+# 不会替 symlink 判定挡枪，去掉卸载侧的 [ -L ] 之后这条用例才会真的变红。
+# 我们创建的 managed 备份永远是 cp 出来的普通文件；固定路径上出现 symlink 就意味着
+# 它不是我们放的，必须 fail-closed。
 new_prefix
 printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
 chmod 0755 "$PREFIX/bin/claude"
 do_install
-printf 'OUTSIDE\n' >"$TMP_DIR/outside-21"
+printf '#!/bin/sh\necho REAL-CLI\n' >"$TMP_DIR/outside-21"
 chmod 0600 "$TMP_DIR/outside-21"
+[ "$(sha256_file "$TMP_DIR/outside-21")" = \
+  "$(sha256_file "$PREFIX/bin/claude.claude-guard-backup")" ] ||
+  fail '用例 21: 前提不成立，外部目标必须与原备份内容相同'
 rm -f "$PREFIX/bin/claude.claude-guard-backup"
 ln -s "$TMP_DIR/outside-21" "$PREFIX/bin/claude.claude-guard-backup"
-if do_uninstall --dry-run; then fail '用例 21: 备份是 symlink 竟然通过'; fi
-[ "$(file_mode "$TMP_DIR/outside-21")" = "600" ] ||
-  fail '用例 21: 顺着 symlink 改动了前缀之外的文件'
+if do_uninstall; then fail '用例 21: 备份路径是 symlink 竟然通过'; fi
+[ -e "$TMP_DIR/outside-21" ] || fail '用例 21: 前缀之外的文件被删除了'
+
+# --- 21b. 安装侧：固定备份路径已是 symlink 时必须拒绝复用 ---
+# 同样让内容相同，否则摘要比对会先一步拦下，capture_original 的 [ -L ] 就测不到。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-CLI\n' >"$TMP_DIR/outside-21b"
+ln -s "$TMP_DIR/outside-21b" "$PREFIX/bin/claude.claude-guard-backup"
+set +e
+CLAUDE_GUARD_PREFIX="$PREFIX" "$ROOT_DIR/scripts/install-entrypoint-shims.sh" \
+  >"$PREFIX/install.out" 2>&1
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail '用例 21b: 备份路径是 symlink 时仍然复用了它' "$PREFIX/install.out"
+grep -q '不是普通文件' "$PREFIX/install.out" ||
+  fail '用例 21b: 未报出备份不是普通文件' "$PREFIX/install.out"
 
 # --- 22. binary 类入口不接受 shim 兜底 ---
 new_prefix
@@ -343,9 +365,10 @@ grep -q -- '--adopt-backup' "$PREFIX/install.out" ||
   fail '用例 23: 未提示用 --adopt-backup 指认' "$PREFIX/install.out"
 
 # --- 24. 卸载中途被打断后必须可以重跑 ---
-# 构造「claude 已恢复且其备份已回收、claude-official 仍是 shim、guard 还在、manifest
-# 还没删」的半完成现场——这正是在 reclaim_backups 之后、删除 manifest 之前被打断的
-# 样子。备份已经没了，重跑只能靠「认出这一份已经是原件」，不能靠重新复制备份。
+# 人为构造的半完成恢复现场：claude 已恢复且其备份已不在，claude-official 仍是 shim，
+# guard 还在，manifest 未删。这不完全对应某个真实时点（真到 reclaim 之后，其余 entry
+# 也都已恢复），但它精确覆盖了要测的那条路径——备份已经没了，重跑只能靠「认出这一份
+# 已经是原件」，不能靠重新复制备份。
 new_prefix
 printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
 chmod 0755 "$PREFIX/bin/claude"
@@ -389,5 +412,63 @@ jq '.entries |= map(if .name == "claude-guard" then .artifact = "shim" else . en
 if do_uninstall; then fail '用例 26: manifest 里 artifact 类型错误竟然通过'; fi
 grep -q 'artifact 必须是 binary' "$PREFIX/uninstall.out" ||
   fail '用例 26: 未报出 artifact 类型不符' "$PREFIX/uninstall.out"
+
+# --- 27. 指认的备份即使恰好在固定路径上也不得删除 ---
+# 「谁拥有这份备份」由 manifest 里的 backup_origin 说了算，不由文件名推断。
+new_prefix
+do_install
+printf '#!/bin/sh\necho ADOPTED-AT-MANAGED-PATH\n' >"$PREFIX/bin/claude.claude-guard-backup"
+do_uninstall --adopt-backup "claude=$PREFIX/bin/claude.claude-guard-backup" ||
+  fail '用例 27: 指认固定路径上的备份被拒绝' "$PREFIX/uninstall.out"
+[ -e "$PREFIX/bin/claude.claude-guard-backup" ] ||
+  fail '用例 27: 被显式指认的备份文件被自动删除了'
+grep -q 'ADOPTED-AT-MANAGED-PATH' "$PREFIX/bin/claude" ||
+  fail '用例 27: 未按指认的备份还原'
+
+# --- 28. 执行阶段失败必须说实话，且可以重跑 ---
+# 确定性的 I/O 故障注入：PATH 上放一个第三次调用才失败的假 cp。三次分别是候选 manifest
+# 的复制、claude 的恢复、claude-official 的恢复，因此第一个入口成功、第二个失败。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-OFFICIAL\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
+claude_original_28="$(sha256_file "$PREFIX/bin/claude")"
+do_install
+mkdir -p "$TMP_DIR/fakebin-28"
+cat >"$TMP_DIR/fakebin-28/cp" <<'FAKE'
+#!/usr/bin/env bash
+count_file="$CLAUDE_GUARD_CP_COUNT"
+n=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$count_file"
+if [ "$n" -ge 3 ]; then
+  printf 'cp: injected failure\n' >&2
+  exit 1
+fi
+exec /bin/cp "$@"
+FAKE
+chmod +x "$TMP_DIR/fakebin-28/cp"
+: >"$TMP_DIR/cp-count-28"
+set +e
+CLAUDE_GUARD_PREFIX="$PREFIX" CLAUDE_GUARD_CP_COUNT="$TMP_DIR/cp-count-28" \
+  PATH="$TMP_DIR/fakebin-28:$PATH" \
+  "$ROOT_DIR/scripts/uninstall.sh" >"$PREFIX/uninstall.out" 2>&1
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail '用例 28: 注入复制失败后仍返回 0' "$PREFIX/uninstall.out"
+if grep -q '未做任何修改' "$PREFIX/uninstall.out"; then
+  fail '用例 28: 执行阶段失败仍谎称未做任何修改' "$PREFIX/uninstall.out"
+fi
+grep -q '可以直接重跑' "$PREFIX/uninstall.out" ||
+  fail '用例 28: 未告知可以重跑' "$PREFIX/uninstall.out"
+# guard 排在最后处理，失败时必须还在，否则重跑就没有 guard 了。
+[ -e "$PREFIX/bin/claude-guard" ] ||
+  fail '用例 28: 失败时 claude-guard 已被删除' "$PREFIX/uninstall.out"
+# 修复条件后重跑必须收口。
+do_uninstall || fail '用例 28: 修复后重跑仍失败' "$PREFIX/uninstall.out"
+[ "$(sha256_file "$PREFIX/bin/claude")" = "$claude_original_28" ] ||
+  fail '用例 28: 重跑后 claude 不是原件'
+grep -q 'REAL-OFFICIAL' "$PREFIX/bin/claude-official" ||
+  fail '用例 28: 重跑后 claude-official 未还原'
+[ ! -e "$PREFIX/bin/claude-guard" ] || fail '用例 28: 重跑后 claude-guard 未清理'
 
 printf 'entrypoint lifecycle ok\n'

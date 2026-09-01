@@ -214,6 +214,17 @@ validate_manifest() {
                  and ((($e.original.backup_path | type) != "string")
                       or (($e.original.backup_path | startswith("/")) | not))
               then "original.backup_path 必须是绝对路径: \($e.name)" else empty end
+          , if $e.original.state == "file"
+                 and (["managed","adopted"] | index($e.original.backup_origin)) == null
+              then "original.backup_origin 取值非法: \($e.name)=\($e.original.backup_origin)"
+              else empty end
+          # managed 的备份必须就在那个固定路径上。允许它指向别处就等于允许卸载器
+          # 去删一个不是它创建的文件。
+          , if $e.original.state == "file"
+                 and $e.original.backup_origin == "managed"
+                 and $e.original.backup_path != ($e.path + ".claude-guard-backup")
+              then "managed 备份路径必须是 \($e.path).claude-guard-backup，实际: \($e.original.backup_path)"
+              else empty end
           , if (["symlink","dangling-symlink"] | index($e.original.state)) != null
                  and ((($e.original.symlink_target | type) != "string")
                       or ($e.original.symlink_target == ""))
@@ -285,8 +296,11 @@ capture_original() {
       digest="$(sha256_file "$source")" || return 1
       mode="$(file_mode "$source")" || return 1
       [ -n "$digest" ] || { printf '无法计算备份摘要: %s\n' "$source" >&2; return 1; }
+      # backup_origin 把「这份备份是谁的」写进记录，而不是靠文件名推断。managed 是
+      # 我们自己创建、卸载完可以回收的；adopted 是用户用 --adopt-backup 指认的既有
+      # 文件，任何情况下都不删——哪怕它恰好就放在固定备份路径上。
       jq -n --arg s "$state" --arg d "$digest" --arg m "$mode" --arg b "$backup" \
-        '{state: $s, sha256: $d, mode: $m, backup_path: $b}' >"$out"
+        '{state: $s, sha256: $d, mode: $m, backup_path: $b, backup_origin: "managed"}' >"$out"
       ;;
   esac
 }
