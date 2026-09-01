@@ -189,6 +189,20 @@ validate_manifest() {
     + (if (.entries | type) != "array" then ["entries 不是数组"] else [] end)
     + [ (.entries // []) | group_by(.name)[] | select(length > 1)
         | "entry 名称重复: \(.[0].name)" ]
+    # 跨记录的所有权冲突：一条记录把某个路径标成 managed（卸载完会删），另一条把
+    # 同一个路径标成 adopted（承诺永不删）。单看任何一条都合法，合起来就让「指认的
+    # 那一份也不删」被一组合法参数打破。所有权必须在记录之间也是一致的。
+    + [ (.entries // []) as $all
+        | $all[]
+        | select(.original.state == "file" and .original.backup_origin == "managed")
+        | .original.backup_path as $mp
+        | .name as $owner
+        | $all[]
+        | select(.name != $owner
+                 and .original.state == "file"
+                 and .original.backup_path == $mp)
+        | "备份路径被多条记录同时声明所有权: \($mp)（managed 属于 \($owner)，"
+          + "\(.name) 也引用了它）" ]
     + [ (.entries // [])[] as $e
         | ( if ($allowed | index($e.name)) == null
               then "entry 名称不在允许列表: \($e.name)" else empty end

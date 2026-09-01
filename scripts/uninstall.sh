@@ -3,8 +3,10 @@ set -euo pipefail
 
 # 按 manifest 把入口恢复成安装前的状态，并移除 Guard 自身装进 $PREFIX/bin 的文件。
 #
-# 全程 fail-closed：任何一项前置条件不满足就整体中止（exit 14），一个文件都不动。
-# 尤其不会「尽力而为地恢复一部分」——恢复到一半的入口比不恢复更难排查。
+# 分两遍。第一遍只校验，任何一项前置条件不满足就整体中止（exit 14），此时一个文件
+# 都没被碰过。第二遍才动文件；跨入口做不到全局原子，但单个入口经暂存文件原子替换，
+# 且整体可以安全重跑——已恢复的入口会被识别并跳过。第二遍里的失败一律走 phase-aware
+# 的提示，绝不谎称「未做任何修改」。
 #
 # 存量用户（v1.0.0 到 v2.1.x 之间装过的）没有 manifest，且 $PREFIX/bin 里可能同时
 # 躺着一个真备份和若干内容其实是 Guard shim 的假备份（issue #15）。这种情况一律先
@@ -328,7 +330,7 @@ restore_entry() {
   case "$state" in
     absent)
       if act "移除 $path"; then return 0; fi
-      rm -f "$path"
+      rm -f "$path" || fail_closed "无法移除入口: $path"
       printf '已移除: %s\n' "$path"
       ;;
     symlink|dangling-symlink)
@@ -374,7 +376,7 @@ reclaim_backups() {
     [ "$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_origin)" = managed ] ||
       continue
     backup="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_path)"
-    rm -f "$backup"
+    rm -f "$backup" || fail_closed "无法回收备份: $backup"
   done <<INNER
 $names
 INNER
@@ -414,7 +416,7 @@ fi
 if act "删除安装记录 $MANIFEST"; then
   :
 else
-  rm -f "$MANIFEST"
+  rm -f "$MANIFEST" || fail_closed "无法删除安装记录: $MANIFEST"
   rmdir "$(dirname "$MANIFEST")" 2>/dev/null || true
   printf '已删除安装记录: %s\n' "$MANIFEST"
 fi

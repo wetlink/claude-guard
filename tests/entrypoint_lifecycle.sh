@@ -471,4 +471,82 @@ grep -q 'REAL-OFFICIAL' "$PREFIX/bin/claude-official" ||
   fail '用例 28: 重跑后 claude-official 未还原'
 [ ! -e "$PREFIX/bin/claude-guard" ] || fail '用例 28: 重跑后 claude-guard 未清理'
 
+# --- 29. 跨 entry 的所有权冲突必须在第一遍拒绝 ---
+# 单看任何一条记录都合法：claude 把某路径标成 adopted（承诺不删），claude-official 把
+# 同一路径标成 managed（卸载完要删）。合起来就让「指认的那一份也不删」被一组合法参数
+# 打破。所有权必须在记录之间也一致。
+new_prefix
+printf '#!/bin/sh\necho REAL-C\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-O\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
+do_install
+shared_29="$PREFIX/bin/claude-official.claude-guard-backup"
+before_29="$(snapshot "$PREFIX/bin")"
+before_29_manifest="$(sha256_file "$(manifest_file)")"
+if do_uninstall --adopt-backup "claude=$shared_29"; then
+  fail '用例 29: 跨 entry 所有权冲突竟然通过'
+fi
+[ -e "$shared_29" ] || fail '用例 29: 冲突被放行，共享备份已被删除'
+[ "$before_29" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 29: 拒绝之后入口仍被改动'
+[ "$(sha256_file "$(manifest_file)")" = "$before_29_manifest" ] ||
+  fail '用例 29: 拒绝之后 manifest 被改写'
+grep -q '同时声明所有权' "$PREFIX/uninstall.out" ||
+  fail '用例 29: 未报出所有权冲突' "$PREFIX/uninstall.out"
+
+# --- 30. 回收阶段的 I/O 失败也必须落到分阶段提示上 ---
+# 这是执行阶段最后一步。它此前是裸 rm -f，失败会被 set -e 直接截断，用户拿到一个原始
+# 退出码和一行 rm 报错，没有任何重跑指引——恰恰是最需要指引的现场。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+original_30="$(sha256_file "$PREFIX/bin/claude")"
+do_install
+mkdir -p "$TMP_DIR/fakebin-30"
+cat >"$TMP_DIR/fakebin-30/rm" <<'FAKE'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *.claude-guard-backup)
+      printf 'rm: injected reclaim failure\n' >&2
+      exit 1
+      ;;
+  esac
+done
+exec /bin/rm "$@"
+FAKE
+chmod +x "$TMP_DIR/fakebin-30/rm"
+set +e
+CLAUDE_GUARD_PREFIX="$PREFIX" PATH="$TMP_DIR/fakebin-30:$PATH" \
+  "$ROOT_DIR/scripts/uninstall.sh" >"$PREFIX/uninstall.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 14 ] ||
+  fail "用例 30: 回收失败应以 14 退出，实际 ${status}" "$PREFIX/uninstall.out"
+if grep -q '未做任何修改' "$PREFIX/uninstall.out"; then
+  fail '用例 30: 回收阶段失败仍谎称未做任何修改' "$PREFIX/uninstall.out"
+fi
+grep -q '可以直接重跑' "$PREFIX/uninstall.out" ||
+  fail '用例 30: 回收失败未告知可以重跑' "$PREFIX/uninstall.out"
+do_uninstall || fail '用例 30: 去掉注入后重跑仍失败' "$PREFIX/uninstall.out"
+[ "$(sha256_file "$PREFIX/bin/claude")" = "$original_30" ] ||
+  fail '用例 30: 重跑后 claude 不是原件'
+
+# --- 31. managed 的备份路径必须固定，不得指向前缀之外 ---
+# 与用例 29 打的不是同一个靶：29 是「两条记录对同一路径声明相反所有权」，这一条是
+# 「单条记录把任意外部路径标成 managed」。约束一旦回归，回收逻辑就会去删它。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+printf 'OUTSIDE DATA\n' >"$TMP_DIR/outside-31"
+jq --arg p "$TMP_DIR/outside-31" \
+  '.entries |= map(if .name == "claude" then .original.backup_path = $p else . end)' \
+  "$(manifest_file)" >"$TMP_DIR/m31" && mv "$TMP_DIR/m31" "$(manifest_file)"
+before_31="$(snapshot "$PREFIX/bin")"
+if do_uninstall; then fail '用例 31: managed 指向前缀外竟然通过'; fi
+[ -e "$TMP_DIR/outside-31" ] || fail '用例 31: 前缀外的文件被删除了'
+[ "$before_31" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 31: 拒绝之后入口仍被改动'
+grep -q 'managed 备份路径必须是' "$PREFIX/uninstall.out" ||
+  fail '用例 31: 未报出 managed 路径越界' "$PREFIX/uninstall.out"
+
 printf 'entrypoint lifecycle ok\n'
