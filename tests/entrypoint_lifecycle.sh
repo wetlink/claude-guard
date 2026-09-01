@@ -212,4 +212,80 @@ do_uninstall || fail '用例 13: 卸载失败' "$PREFIX/uninstall.out"
 [ -e "$PREFIX/bin/claude.bak-before-claude-guard-v2.0.0" ] ||
   fail '用例 13: 历史备份被自动删除了'
 
+# 以下六条来自 PR #21 的独立复审。每一条都对应一个当时能实际复现的失败现场。
+
+manifest_sha() { sha256_file "$(manifest_file)"; }
+
+# --- 14. --dry-run 配合 --adopt-backup 不得写盘 ---
+new_prefix
+do_install
+printf '#!/bin/sh\necho ADOPTED\n' >"$TMP_DIR/adopt-14"
+before_sha="$(manifest_sha)"
+do_uninstall --dry-run --adopt-backup "claude=$TMP_DIR/adopt-14" ||
+  fail '用例 14: dry-run 退出码非零' "$PREFIX/uninstall.out"
+[ "$(manifest_sha)" = "$before_sha" ] ||
+  fail '用例 14: dry-run 期间 manifest 被改写'
+
+# --- 15. 多个 adoption 不是逐条落盘：后一条失败时前一条也不得生效 ---
+new_prefix
+do_install
+printf '#!/bin/sh\necho ADOPTED\n' >"$TMP_DIR/adopt-15"
+before_sha="$(manifest_sha)"
+if do_uninstall --adopt-backup "claude=$TMP_DIR/adopt-15" \
+                --adopt-backup "claude-official=$TMP_DIR/does-not-exist"; then
+  fail '用例 15: 第二条 adoption 不存在却仍然成功'
+fi
+[ "$(manifest_sha)" = "$before_sha" ] ||
+  fail '用例 15: 第一条 adoption 已持久化，但命令报告未做任何修改'
+
+# --- 16. 越界 path 必须 exit 14，且前缀外的文件不得被删除 ---
+new_prefix
+do_install
+printf 'USER DATA\n' >"$TMP_DIR/outside-16.txt"
+outside_sha="$(sha256_file "$TMP_DIR/outside-16.txt")"
+jq --arg p "$TMP_DIR/outside-16.txt" --arg d "$outside_sha" \
+  '.entries |= map(if .name == "claude"
+     then .path = $p | .artifact_sha256 = $d | .original = {state: "absent"}
+     else . end)' "$(manifest_file)" >"$TMP_DIR/m16" && mv "$TMP_DIR/m16" "$(manifest_file)"
+if do_uninstall; then fail '用例 16: 越界 path 竟然执行成功'; fi
+[ -e "$TMP_DIR/outside-16.txt" ] || fail '用例 16: 前缀外的文件被删除了'
+grep -q 'entry path 必须等于' "$PREFIX/uninstall.out" ||
+  fail '用例 16: 未报出 path 越界' "$PREFIX/uninstall.out"
+
+# --- 17. 非法 mode 必须在第一遍就 exit 14，所有入口逐项不变 ---
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+before_mode="$(snapshot "$PREFIX/bin")"
+jq '.entries |= map(if .name == "claude" then .original.mode = "invalid" else . end)' \
+  "$(manifest_file)" >"$TMP_DIR/m17" && mv "$TMP_DIR/m17" "$(manifest_file)"
+if do_uninstall; then fail '用例 17: 非法 mode 竟然执行成功'; fi
+[ "$before_mode" = "$(snapshot "$PREFIX/bin")" ] ||
+  fail '用例 17: 第二遍中途失败，留下了恢复一半的现场'
+
+# --- 18. 指向别处 guard 的 shim 不算「我们装的」，必须 exit 14 且不被覆盖 ---
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+shim_body "/somewhere/else/bin/claude-guard" >"$PREFIX/bin/claude"
+foreign_sha="$(sha256_file "$PREFIX/bin/claude")"
+if do_uninstall; then fail '用例 18: 外来 shim 竟然被当成我们装的'; fi
+[ "$(sha256_file "$PREFIX/bin/claude")" = "$foreign_sha" ] ||
+  fail '用例 18: 外来 shim 被覆盖了'
+
+# --- 19. 安装在「备份已放好、manifest 未提交」处被打断后，重试必须能继续 ---
+# 这是 cp 与 mv 之间那个窗口被打断后的现场。旧实现会撞上「备份文件已存在」而永久
+# 卡死，用户没有任何出路。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+original_sha="$(sha256_file "$PREFIX/bin/claude")"
+cp -p "$PREFIX/bin/claude" "$PREFIX/bin/claude.claude-guard-backup"
+do_install
+do_uninstall || fail '用例 19: 中断后重试的卸载失败' "$PREFIX/uninstall.out"
+[ "$(sha256_file "$PREFIX/bin/claude")" = "$original_sha" ] ||
+  fail '用例 19: 复用中断留下的备份后没有还原出原始 CLI'
+
 printf 'entrypoint lifecycle ok\n'
