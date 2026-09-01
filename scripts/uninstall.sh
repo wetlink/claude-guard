@@ -47,8 +47,9 @@ fail_closed() {
   if [ "$PHASE" = precheck ]; then
     printf '未做任何修改。先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
   else
-    printf '部分入口可能已经恢复。安装记录与备份都已保留，修复上述问题后可以直接重跑\n' >&2
-    printf 'scripts/uninstall.sh——已经恢复好的入口会被识别并跳过。\n' >&2
+    printf '部分入口可能已经恢复，部分备份可能已经回收。安装记录仍然保留，尚未回收的\n' >&2
+    printf '备份也仍然保留；修复上述问题后可以直接重跑 scripts/uninstall.sh——已经恢复好\n' >&2
+    printf '的入口会被识别并跳过。\n' >&2
   fi
   exit 14
 }
@@ -184,6 +185,48 @@ EOF
 
 # adoption 之后再校验一次：指认动作本身也可能把 manifest 写成不合法的形态。
 validate_manifest "$CANDIDATE" "$BIN_DIR" || fail_closed "指认备份后的安装记录未通过校验"
+
+# 跨记录的备份所有权冲突，按「解析之后是不是同一个文件」判断。
+#
+# validate_manifest 里那条同名校验比的是字符串，挡得住字面相同，挡不住别名——
+# $BIN/../bin/x 与 $BIN/x 是同一个文件却是两个字符串。这里在 shell 侧按 canonical_path
+# 归一后再比，因为 jq 没法解析文件系统路径。
+#
+# 归一只发生在这里的比较中，既不写回 manifest 也不改 adopt 时记录的原始路径：
+# 把 PREFIX 归一会改变安装产物本身（macOS 上
+# /var 会被解析成 /private/var），用户的路径若是软链，shim 里就会硬写物理路径。
+check_backup_ownership_conflicts() {
+  local manifest="$1"
+  local name state origin raw canon owner_name owner_canon
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    state="$(manifest_entry_field "$manifest" "$name" original.state)"
+    [ "$state" = file ] || continue
+    origin="$(manifest_entry_field "$manifest" "$name" original.backup_origin)"
+    [ "$origin" = managed ] || continue
+    raw="$(manifest_entry_field "$manifest" "$name" original.backup_path)"
+    owner_canon="$(canonical_path "$raw" 2>/dev/null || printf '%s\n' "$raw")"
+    owner_name="$name"
+
+    while IFS= read -r other; do
+      [ -n "$other" ] || continue
+      [ "$other" != "$owner_name" ] || continue
+      [ "$(manifest_entry_field "$manifest" "$other" original.state)" = file ] || continue
+      raw="$(manifest_entry_field "$manifest" "$other" original.backup_path)"
+      canon="$(canonical_path "$raw" 2>/dev/null || printf '%s\n' "$raw")"
+      if [ "$canon" = "$owner_canon" ]; then
+        fail_closed "备份路径被多条记录同时声明所有权: ${owner_canon}（managed 属于 ${owner_name}，${other} 也引用了它）"
+      fi
+    done <<INNER
+$(jq -r '.entries[].name' "$manifest")
+INNER
+  done <<OUTER
+$(jq -r '.entries[].name' "$manifest")
+OUTER
+}
+
+check_backup_ownership_conflicts "$CANDIDATE"
 
 # ---- 第一遍：只校验，不动文件。全部通过之后才进入第二遍执行 ----
 

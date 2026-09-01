@@ -58,6 +58,24 @@ file_mode() {
   return 1
 }
 
+# 把路径归一到不含 . / .. 段的绝对形式。所有权比较必须在归一之后做——同一个文件
+# 可以有无数种字符串写法，只比字符串就等于没比。目录不存在时原样返回并置非零，由调用
+# 方决定怎么处理。
+canonical_path() {
+  local p="$1" dir base
+  dir="$(dirname "$p")"
+  base="$(basename "$p")"
+  if ! dir="$(cd "$dir" 2>/dev/null && pwd -P)"; then
+    printf '%s\n' "$p"
+    return 1
+  fi
+  case "$base" in
+    .) printf '%s\n' "$dir" ;;
+    ..) dirname "$dir" ;;
+    *) printf '%s/%s\n' "${dir%/}" "$base" ;;
+  esac
+}
+
 manifest_path() {
   printf '%s/share/claude-guard/entrypoints.json\n' "$1"
 }

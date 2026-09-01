@@ -14,6 +14,7 @@ TARGET="$BIN_DIR/claude-guard"
 MANIFEST="$(manifest_path "$PREFIX")"
 
 mkdir -p "$BIN_DIR"
+
 manifest_init "$MANIFEST"
 # 坏 manifest 必须在动任何文件之前就拦住。否则安装照常覆盖入口、坏记录继续留着，
 # 直到卸载时才发现恢复不回去——那时入口已经被接管了。

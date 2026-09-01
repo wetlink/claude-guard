@@ -13,6 +13,8 @@ BIN_DIR="$PREFIX/bin"
 GUARD_TARGET="$BIN_DIR/claude-guard"
 MANIFEST="$(manifest_path "$PREFIX")"
 
+mkdir -p "$BIN_DIR"
+
 install_shim() {
   local name="$1"
   local target="$BIN_DIR/$name"
@@ -29,7 +31,6 @@ install_shim() {
   printf '已安装入口: %s -> %s\n' "$target" "$GUARD_TARGET"
 }
 
-mkdir -p "$BIN_DIR"
 manifest_init "$MANIFEST"
 # 坏 manifest 必须在动任何文件之前就拦住。否则安装照常覆盖入口、坏记录继续留着，
 # 直到卸载时才发现恢复不回去——那时入口已经被接管了。

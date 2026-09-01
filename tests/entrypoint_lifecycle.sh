@@ -493,12 +493,13 @@ fi
 grep -q '同时声明所有权' "$PREFIX/uninstall.out" ||
   fail '用例 29: 未报出所有权冲突' "$PREFIX/uninstall.out"
 
-# --- 30. 回收阶段的 I/O 失败也必须落到分阶段提示上 ---
-# 这是执行阶段最后一步。它此前是裸 rm -f，失败会被 set -e 直接截断，用户拿到一个原始
-# 退出码和一行 rm 报错，没有任何重跑指引——恰恰是最需要指引的现场。
+# --- 30. 回收阶段的 I/O 失败也必须落到分阶段提示上，且提示要与现场相符 ---
+# 两个入口各有一份 managed 备份，让假 rm 只在回收第二份时失败。这样现场是「第一份已
+# 回收、第二份还在」——文案就不能笼统地说「备份都已保留」。
 new_prefix
-printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
-chmod 0755 "$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-C\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-O\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
 original_30="$(sha256_file "$PREFIX/bin/claude")"
 do_install
 mkdir -p "$TMP_DIR/fakebin-30"
@@ -506,7 +507,7 @@ cat >"$TMP_DIR/fakebin-30/rm" <<'FAKE'
 #!/usr/bin/env bash
 for a in "$@"; do
   case "$a" in
-    *.claude-guard-backup)
+    *claude-official.claude-guard-backup)
       printf 'rm: injected reclaim failure\n' >&2
       exit 1
       ;;
@@ -522,8 +523,17 @@ status=$?
 set -e
 [ "$status" -eq 14 ] ||
   fail "用例 30: 回收失败应以 14 退出，实际 ${status}" "$PREFIX/uninstall.out"
+# 现场：第一份已回收、第二份还在、manifest 还在。
+[ ! -e "$PREFIX/bin/claude.claude-guard-backup" ] ||
+  fail '用例 30: 第一份备份应已回收'
+[ -e "$PREFIX/bin/claude-official.claude-guard-backup" ] ||
+  fail '用例 30: 第二份备份不该消失'
+[ -e "$(manifest_file)" ] || fail '用例 30: 安装记录不该被删除'
 if grep -q '未做任何修改' "$PREFIX/uninstall.out"; then
   fail '用例 30: 回收阶段失败仍谎称未做任何修改' "$PREFIX/uninstall.out"
+fi
+if grep -q '备份都已保留' "$PREFIX/uninstall.out"; then
+  fail '用例 30: 已回收一份却声称备份都已保留' "$PREFIX/uninstall.out"
 fi
 grep -q '可以直接重跑' "$PREFIX/uninstall.out" ||
   fail '用例 30: 回收失败未告知可以重跑' "$PREFIX/uninstall.out"
@@ -538,7 +548,9 @@ new_prefix
 printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
 chmod 0755 "$PREFIX/bin/claude"
 do_install
-printf 'OUTSIDE DATA\n' >"$TMP_DIR/outside-31"
+# 内容必须与真实 managed 备份逐字节相同，否则摘要检查会先一步拦住，路径校验这道门
+# 就测不到；断言的重点是「外部文件有没有被删」这个行为，文案只是补充。
+cp -p "$PREFIX/bin/claude.claude-guard-backup" "$TMP_DIR/outside-31"
 jq --arg p "$TMP_DIR/outside-31" \
   '.entries |= map(if .name == "claude" then .original.backup_path = $p else . end)' \
   "$(manifest_file)" >"$TMP_DIR/m31" && mv "$TMP_DIR/m31" "$(manifest_file)"
@@ -548,5 +560,25 @@ if do_uninstall; then fail '用例 31: managed 指向前缀外竟然通过'; fi
 [ "$before_31" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 31: 拒绝之后入口仍被改动'
 grep -q 'managed 备份路径必须是' "$PREFIX/uninstall.out" ||
   fail '用例 31: 未报出 managed 路径越界' "$PREFIX/uninstall.out"
+
+# --- 32. 非规范路径别名不得绕过所有权校验 ---
+# $BIN/../bin/x 与 $BIN/x 是同一个文件，但字符串不同。用例 29 拦的是「字面相同」，
+# 这一条拦的是「解析后相同」——只比字符串等于没比。
+new_prefix
+printf '#!/bin/sh\necho REAL-C\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-O\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
+do_install
+shared_32="$PREFIX/bin/claude-official.claude-guard-backup"
+alias_32="$PREFIX/bin/../bin/claude-official.claude-guard-backup"
+before_32="$(snapshot "$PREFIX/bin")"
+before_32_manifest="$(sha256_file "$(manifest_file)")"
+if do_uninstall --adopt-backup "claude=$alias_32"; then
+  fail '用例 32: ../ 别名绕过了所有权校验'
+fi
+[ -e "$shared_32" ] || fail '用例 32: 别名被放行，共享备份已被删除'
+[ "$before_32" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 32: 拒绝之后入口仍被改动'
+[ "$(sha256_file "$(manifest_file)")" = "$before_32_manifest" ] ||
+  fail '用例 32: 拒绝之后 manifest 被改写'
 
 printf 'entrypoint lifecycle ok\n'
