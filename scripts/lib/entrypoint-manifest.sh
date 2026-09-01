@@ -196,6 +196,12 @@ validate_manifest() {
               then "entry path 必须等于 \($bin)/\($e.name)，实际: \($e.path)" else empty end
           , if ($allowed | length) > 0 and (["shim","binary"] | index($e.artifact)) == null
               then "artifact 取值非法: \($e.name)=\($e.artifact)" else empty end
+          # 名称与 artifact 类型必须绑死。否则把 claude-guard 这个 binary 改成一个
+          # 合法 shim，卸载器的 shim 兜底就会认下它并删除。
+          , if (["claude","claude-official"] | index($e.name)) != null and $e.artifact != "shim"
+              then "\($e.name) 的 artifact 必须是 shim，实际: \($e.artifact)" else empty end
+          , if (["claude-guard","claude-cc"] | index($e.name)) != null and $e.artifact != "binary"
+              then "\($e.name) 的 artifact 必须是 binary，实际: \($e.artifact)" else empty end
           , if ($e.artifact_sha256 | hex64) | not
               then "artifact_sha256 不是 64 位十六进制: \($e.name)" else empty end
           , if (["absent","file","symlink","dangling-symlink"] | index($e.original.state)) == null
@@ -250,16 +256,18 @@ capture_original() {
       backup="$(backup_path_for "$path")"
       if [ -e "$backup" ] || [ -L "$backup" ]; then
         # 正式备份已存在但 manifest 里没有这个条目，只可能是上一次安装在
-        # 「备份已改名、manifest 尚未提交」这一瞬间被打断。此时正式备份的内容按
-        # 定义就是原始入口，直接复用即可——否则每次重试都会撞上「备份已存在」而
-        # 永久卡死，用户没有任何出路。
-        if is_guard_shim "$backup"; then
-          printf '备份文件内容是 Guard shim，无法当作原始入口: %s\n' "$backup" >&2
+        # 「备份已改名、manifest 尚未提交」这一瞬间被打断。
+        #
+        # 关键：那个窗口里入口本身还没有被覆盖，所以正式备份必然与当前入口逐字节
+        # 相同。这就是唯一可以自动复用的条件——凡是证明不了来源的备份，一律交给
+        # 人去 --inspect / --adopt-backup，不做任何猜测。
+        if [ -L "$backup" ] || [ ! -f "$backup" ]; then
+          printf '备份路径不是普通文件，拒绝当作原始入口: %s\n' "$backup" >&2
           return 1
         fi
-        if ! is_guard_shim_for "$path" "$(dirname "$path")/claude-guard" &&
-           [ "$(sha256_file "$path")" != "$(sha256_file "$backup")" ]; then
-          printf '备份文件已存在且与当前入口不一致，请先人工确认: %s\n' "$backup" >&2
+        if [ "$(sha256_file "$path")" != "$(sha256_file "$backup")" ]; then
+          printf '备份文件已存在但与当前入口不一致，无法证明它就是原始入口: %s\n' "$backup" >&2
+          printf '请先运行 scripts/uninstall.sh --inspect 查看，再用 --adopt-backup 显式指认。\n' >&2
           return 1
         fi
         printf '复用上次中断留下的备份: %s\n' "$backup" >&2

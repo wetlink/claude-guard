@@ -288,4 +288,106 @@ do_uninstall || fail '用例 19: 中断后重试的卸载失败' "$PREFIX/uninst
 [ "$(sha256_file "$PREFIX/bin/claude")" = "$original_sha" ] ||
   fail '用例 19: 复用中断留下的备份后没有还原出原始 CLI'
 
+# 以下五条来自 PR #21 的第二轮独立复审。
+
+# --- 20. --dry-run 不得改动真实备份的权限位 ---
+# 上一版为了确认 mode 可用，直接对真实备份 chmod，于是「预演」自己成了副作用。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+jq '.entries |= map(if .name == "claude" then .original.mode = "600" else . end)' \
+  "$(manifest_file)" >"$TMP_DIR/m20" && mv "$TMP_DIR/m20" "$(manifest_file)"
+do_uninstall --dry-run || fail '用例 20: dry-run 退出码非零' "$PREFIX/uninstall.out"
+[ "$(file_mode "$PREFIX/bin/claude.claude-guard-backup")" = "755" ] ||
+  fail '用例 20: dry-run 改动了真实备份的权限位'
+
+# --- 21. 备份路径是 symlink 时必须拒绝，绝不能顺着写到前缀之外 ---
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+printf 'OUTSIDE\n' >"$TMP_DIR/outside-21"
+chmod 0600 "$TMP_DIR/outside-21"
+rm -f "$PREFIX/bin/claude.claude-guard-backup"
+ln -s "$TMP_DIR/outside-21" "$PREFIX/bin/claude.claude-guard-backup"
+if do_uninstall --dry-run; then fail '用例 21: 备份是 symlink 竟然通过'; fi
+[ "$(file_mode "$TMP_DIR/outside-21")" = "600" ] ||
+  fail '用例 21: 顺着 symlink 改动了前缀之外的文件'
+
+# --- 22. binary 类入口不接受 shim 兜底 ---
+new_prefix
+do_install
+# 经临时文件再就位：直接重定向到同一路径会被 ShellCheck 判为同一管线内读写同一文件。
+shim_body "$PREFIX/bin/claude-guard" >"$TMP_DIR/guard-as-shim"
+cp "$TMP_DIR/guard-as-shim" "$PREFIX/bin/claude-guard"
+guard_sha="$(sha256_file "$PREFIX/bin/claude-guard")"
+if do_uninstall; then fail '用例 22: claude-guard 被换成 shim 后竟然通过'; fi
+[ "$(sha256_file "$PREFIX/bin/claude-guard")" = "$guard_sha" ] ||
+  fail '用例 22: binary 入口被删除了'
+
+# --- 23. 中断复用只接受与当前入口逐字节相同的备份 ---
+# 真正的中断窗口发生在入口尚未被覆盖时，因此备份必然等于当前入口。任何证明不了
+# 来源的备份都要交给人去指认，不能静默认作原件。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+printf '#!/bin/sh\necho UNRELATED\n' >"$PREFIX/bin/claude.claude-guard-backup"
+set +e
+CLAUDE_GUARD_PREFIX="$PREFIX" "$ROOT_DIR/scripts/install-entrypoint-shims.sh" \
+  >"$PREFIX/install.out" 2>&1
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail '用例 23: 来源不明的备份被静默认作原件' "$PREFIX/install.out"
+grep -q -- '--adopt-backup' "$PREFIX/install.out" ||
+  fail '用例 23: 未提示用 --adopt-backup 指认' "$PREFIX/install.out"
+
+# --- 24. 卸载中途被打断后必须可以重跑 ---
+# 构造「claude 已恢复且其备份已回收、claude-official 仍是 shim、guard 还在、manifest
+# 还没删」的半完成现场——这正是在 reclaim_backups 之后、删除 manifest 之前被打断的
+# 样子。备份已经没了，重跑只能靠「认出这一份已经是原件」，不能靠重新复制备份。
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+original_24="$(sha256_file "$PREFIX/bin/claude")"
+do_install
+cp -p "$PREFIX/bin/claude.claude-guard-backup" "$PREFIX/bin/claude"
+rm -f "$PREFIX/bin/claude.claude-guard-backup"
+do_uninstall || fail '用例 24: 半完成状态下重跑卸载失败' "$PREFIX/uninstall.out"
+[ "$(sha256_file "$PREFIX/bin/claude")" = "$original_24" ] ||
+  fail '用例 24: 重跑后 claude 不是原件'
+[ ! -e "$PREFIX/bin/claude-official" ] || fail '用例 24: claude-official 未被清理'
+[ ! -e "$PREFIX/bin/claude-guard" ] || fail '用例 24: claude-guard 未被清理'
+
+# --- 25. 坏 manifest 下重装必须 fail-closed，入口与 manifest 均不变 ---
+new_prefix
+printf '#!/bin/sh\necho REAL-CLI\n' >"$PREFIX/bin/claude"
+chmod 0755 "$PREFIX/bin/claude"
+do_install
+jq --arg p "/tmp/evil-path-25" \
+  '.entries |= map(if .name == "claude" then .path = $p else . end)' \
+  "$(manifest_file)" >"$TMP_DIR/m25" && mv "$TMP_DIR/m25" "$(manifest_file)"
+before_bad="$(snapshot "$PREFIX/bin")"
+before_bad_manifest="$(sha256_file "$(manifest_file)")"
+set +e
+CLAUDE_GUARD_PREFIX="$PREFIX" "$ROOT_DIR/scripts/install-entrypoint-shims.sh" \
+  >"$PREFIX/install.out" 2>&1
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail '用例 25: 坏 manifest 下重装竟然成功' "$PREFIX/install.out"
+[ "$before_bad" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 25: 坏 manifest 下入口被改动'
+[ "$(sha256_file "$(manifest_file)")" = "$before_bad_manifest" ] ||
+  fail '用例 25: 坏 manifest 被改写'
+
+# --- 26. manifest 自称 claude-guard 是 shim 时必须在校验阶段就拒绝 ---
+# 用例 22 拦的是「文件被换成 shim」，由 check_entry 的类型限制负责；这一条拦的是
+# 「记录本身声称类型不对」，由 validate_manifest 负责。两道防线打的不是同一个靶。
+new_prefix
+do_install
+jq '.entries |= map(if .name == "claude-guard" then .artifact = "shim" else . end)' \
+  "$(manifest_file)" >"$TMP_DIR/m26" && mv "$TMP_DIR/m26" "$(manifest_file)"
+if do_uninstall; then fail '用例 26: manifest 里 artifact 类型错误竟然通过'; fi
+grep -q 'artifact 必须是 binary' "$PREFIX/uninstall.out" ||
+  fail '用例 26: 未报出 artifact 类型不符' "$PREFIX/uninstall.out"
+
 printf 'entrypoint lifecycle ok\n'
