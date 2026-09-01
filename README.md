@@ -180,7 +180,13 @@ Schannel 后端，因此仅仅调整 PATH 顺序并不保证换到 OpenSSL。换
 ~/.local/bin/claude-official
 ```
 
-两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v2.0.0`。
+两个入口都会先进入 `~/.local/bin/claude-guard`。
+
+安装时会把每个入口在被接管**之前**的状态记进
+`~/.local/share/claude-guard/entrypoints.json`：原本是普通文件就备份为
+`<入口>.claude-guard-backup`；原本是 symlink 则只记录它指向哪里，不复制文件——`cp`
+会把 symlink 展平成普通文件，链接关系就再也回不去了。这份记录**只在首次接管某个入口
+时写入**，之后无论升级多少个版本都不会重采。
 
 `v0.2.2` 只负责入口收敛；`v0.2.1` 负责客户端指纹 tripwire。这样两个风险边界分开，后续回滚也更清楚。
 
@@ -192,6 +198,52 @@ Schannel 后端，因此仅仅调整 PATH 顺序并不保证换到 OpenSSL。换
 
 它只安装 `~/.local/bin/claude-cc`，不会修改 `claude`、官方 profile 或 CC Switch
 应用本身。
+
+## 卸载
+
+```bash
+./scripts/uninstall.sh
+```
+
+它按安装记录把 `claude`、`claude-official`、`claude-cc` 恢复成被接管之前的状态
+（symlink 仍恢复为 symlink），并移除 Guard 自己装进 `~/.local/bin` 的
+`claude-guard` 与 `claude-cc`，最后删掉安装记录。
+
+全程 **fail-closed**：只要有一项前置条件不满足就整体中止（退出码 `14`），一个文件都
+不动。不会「尽力恢复一部分」——恢复到一半的入口比不恢复更难排查。会中止的情况包括：
+
+- 找不到安装记录，或记录不是有效 JSON
+- 当前入口既不是 Guard shim 也不是安装时写入的内容（说明你后来改过它）
+- 记录里指向的备份不存在，或摘要对不上
+- 备份文件的内容本身是一个 Guard shim
+
+想先看看会发生什么：
+
+```bash
+./scripts/uninstall.sh --inspect    # 只读，列出每个入口现状与找到的历史备份
+./scripts/uninstall.sh --dry-run    # 打印每一步，不修改任何文件
+```
+
+### 从 v2.2.0 之前的版本升上来
+
+`v2.2.0` 之前没有安装记录，且备份文件名跟随版本号。如果你在多个版本上跑过入口安装
+脚本，`~/.local/bin` 里可能同时躺着一个真备份和若干**内容其实是 shim** 的假备份。
+
+先跑 `--inspect`，它会逐个给出判定：
+
+```
+      历史备份 ~/.local/bin/claude.bak-before-claude-guard-v2.0.0：不是 Guard shim，可能是真备份
+      历史备份 ~/.local/bin/claude.bak-before-claude-guard-v2.1.3：内容是 Guard shim，不是原始入口
+```
+
+确认哪一个是真原件之后，显式指认它：
+
+```bash
+./scripts/uninstall.sh --adopt-backup claude=~/.local/bin/claude.bak-before-claude-guard-v2.0.0
+```
+
+指认时会再校验一次「它不是 Guard shim」。历史备份文件**一律不会被自动删除**，包括你
+指认的那一份——判断哪个是真原件需要人来看，脚本不替你删。
 
 ## 配置
 
@@ -423,6 +475,11 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - `--version` 输出。
 - `--help` 输出。
 - 入口 shim 安装路径。
+- 入口安装/卸载 round-trip：原入口为普通文件、symlink、悬空 symlink、以及原本不存在
+  四种形态，卸载后必须与安装前逐项相同。
+- 重复安装不重采原入口状态，也不产生第二份备份。
+- 卸载的 fail-closed 路径：入口被手工改过、安装记录缺失、备份内容是 Guard shim。
+- `--inspect` 与 `--dry-run` 确为只读。
 - 缺失配置失败路径。
 - `command` 非绝对路径失败路径。
 - 客户端指纹 tripwire active/strict 失败路径。
