@@ -10,6 +10,22 @@ bash -n "$ROOT_DIR/bin/claude-cc"
 bash -n "$ROOT_DIR/scripts/install.sh"
 bash -n "$ROOT_DIR/scripts/install-entrypoint-shims.sh"
 bash -n "$ROOT_DIR/scripts/install-cc-entrypoint.sh"
+bash -n "$ROOT_DIR/scripts/uninstall.sh"
+bash -n "$ROOT_DIR/scripts/lib/entrypoint-manifest.sh"
+
+# bash 3.2（macOS 系统自带）会把紧跟在 $var 后面的多字节字符的首字节吞进变量名，
+# 于是 set -u 下报出 "path?: unbound variable" 这种谁也看不懂的错。bash 5 没有这个
+# 行为，ShellCheck 也不报，因此只有跑在 macOS 上才会炸——本仓库几乎全是中文提示语，
+# 这个坑一碰一个准。写成 ${var} 即可。
+# 注释里怎么写都不影响运行，排除掉。grep 的输出是「文件:行号:内容」，所以注释的
+# 判断要跨过前两段，不能简单地锚在行首。
+if git -C "$ROOT_DIR" ls-files 'bin/*' 'scripts/*.sh' 'tests/*.sh' |
+    xargs grep -n '\$[A-Za-z_][A-Za-z0-9_]*[^ -~]' 2>/dev/null |
+    grep -vE '^[^:]*:[0-9]+:[[:space:]]*#'; then
+  # shellcheck disable=SC2016  # 提示文本本身要原样显示 $变量 与 ${变量} 两种写法
+  printf '上列位置的 $变量 后面紧跟多字节字符，在 bash 3.2 下会被吞进变量名，请改写成 ${变量}。\n' >&2
+  exit 1
+fi
 
 expected_version="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
 version="$("$ROOT_DIR/bin/claude-guard" --version)"
