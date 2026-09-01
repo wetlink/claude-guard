@@ -118,11 +118,21 @@ fi
 [ -e "$MANIFEST" ] || fail_closed "找不到安装记录: $MANIFEST"
 jq empty "$MANIFEST" >/dev/null 2>&1 || fail_closed "安装记录不是有效 JSON: $MANIFEST"
 
-manifest_version="$(jq -r '.manifest_version // empty' "$MANIFEST")"
-[ "$manifest_version" = "$CLAUDE_GUARD_MANIFEST_VERSION" ] ||
-  fail_closed "安装记录版本不受支持: ${manifest_version:-unknown}"
+# 结构与路径约束要在任何文件动作之前跑。卸载器按 entries[].path 删文件、按
+# original.mode 执行 chmod，这些值不受约束就意味着一个被改过的 manifest 能让它删掉
+# 前缀之外的文件，或者在第二遍中途因 chmod 失败而留下「恢复一半」。
+validate_manifest "$MANIFEST" "$BIN_DIR" || fail_closed "安装记录未通过校验: $MANIFEST"
 
-# --adopt-backup：把用户显式指认的文件写进 manifest 作为该入口的原始备份。
+# 所有改动先落在候选 manifest 上，全部校验通过之后才在执行阶段一次性提交。
+# --dry-run 只读候选，绝不替换正式文件。
+CANDIDATE="$MANIFEST.candidate.$$"
+# 第二遍读哪一份：apply 模式下候选已被提交成正式 manifest，dry-run 下仍是候选。
+ACTIVE_MANIFEST="$CANDIDATE"
+cleanup_candidate() { rm -f "$CANDIDATE"; }
+trap cleanup_candidate EXIT
+cp "$MANIFEST" "$CANDIDATE"
+
+# --adopt-backup：把用户显式指认的文件写进候选 manifest 作为该入口的原始备份。
 adopt_backup() {
   local spec="$1"
   local name backup digest mode tmp
@@ -130,22 +140,26 @@ adopt_backup() {
   name="${spec%%=*}"
   backup="${spec#*=}"
 
-  manifest_has_entry "$MANIFEST" "$name" ||
+  manifest_has_entry "$CANDIDATE" "$name" ||
     fail_closed "安装记录里没有这个入口，无法指认备份: $name"
   [ -f "$backup" ] || fail_closed "指认的备份不存在或不是普通文件: $backup"
   if is_guard_shim "$backup"; then
     fail_closed "指认的备份内容是 Guard shim，不是原始入口: $backup"
   fi
+  case "$backup" in
+    /*) ;;
+    *) fail_closed "指认的备份必须是绝对路径: $backup" ;;
+  esac
 
   digest="$(sha256_file "$backup")" || exit 14
   mode="$(file_mode "$backup")" || exit 14
-  tmp="$MANIFEST.tmp.$$"
+  tmp="$CANDIDATE.tmp.$$"
   jq --arg n "$name" --arg b "$backup" --arg d "$digest" --arg m "$mode" \
     '.entries |= map(
        if .name == $n
        then .original = {state: "file", sha256: $d, mode: $m, backup_path: $b}
-       else . end)' "$MANIFEST" >"$tmp"
-  mv "$tmp" "$MANIFEST"
+       else . end)' "$CANDIDATE" >"$tmp"
+  mv "$tmp" "$CANDIDATE"
   printf '已指认备份: %s -> %s\n' "$name" "$backup"
 }
 
@@ -156,16 +170,19 @@ done <<EOF
 $ADOPTIONS
 EOF
 
+# adoption 之后再校验一次：指认动作本身也可能把 manifest 写成不合法的形态。
+validate_manifest "$CANDIDATE" "$BIN_DIR" || fail_closed "指认备份后的安装记录未通过校验"
+
 # ---- 第一遍：只校验，不动文件。全部通过之后才进入第二遍执行 ----
 
 check_entry() {
   local name="$1"
   local path state recorded_sha current_sha backup backup_sha
 
-  path="$(manifest_entry_field "$MANIFEST" "$name" path)"
+  path="$(manifest_entry_field "$CANDIDATE" "$name" path)"
   [ -n "$path" ] || fail_closed "安装记录里的条目缺少 path: $name"
 
-  recorded_sha="$(manifest_entry_field "$MANIFEST" "$name" artifact_sha256)"
+  recorded_sha="$(manifest_entry_field "$CANDIDATE" "$name" artifact_sha256)"
   case "$(entry_state "$path")" in
     absent)
       # 入口已经不在了，恢复时按 original 处理即可，这里没有可校验的对象。
@@ -175,16 +192,19 @@ check_entry() {
       ;;
     file)
       current_sha="$(sha256_file "$path")" || exit 14
-      if [ "$current_sha" != "$recorded_sha" ] && ! is_guard_shim "$path"; then
-        fail_closed "当前入口既不是安装时的内容也不是 Guard shim，可能已被手工修改，拒绝改动: $path"
+      # 严格版判定：只接受指向本前缀 claude-guard 的 shim。用宽松版会把指向别处
+      # guard 的 shim 也当成「我们装的、可以覆盖」，那是别人的入口。
+      if [ "$current_sha" != "$recorded_sha" ] &&
+         ! is_guard_shim_for "$path" "$BIN_DIR/claude-guard"; then
+        fail_closed "当前入口既不是安装时的内容也不是本前缀的 Guard shim，可能已被手工修改，拒绝改动: $path"
       fi
       ;;
   esac
 
-  state="$(manifest_entry_field "$MANIFEST" "$name" original.state)"
+  state="$(manifest_entry_field "$CANDIDATE" "$name" original.state)"
   [ "$state" = file ] || return 0
 
-  backup="$(manifest_entry_field "$MANIFEST" "$name" original.backup_path)"
+  backup="$(manifest_entry_field "$CANDIDATE" "$name" original.backup_path)"
   [ -n "$backup" ] || fail_closed "安装记录声明有备份却没有 backup_path: $name"
   [ -f "$backup" ] || fail_closed "安装记录指向的备份不存在: $backup"
   # 这一条正是 issue #15 留下的现场：备份文件里躺着的是 Guard shim。
@@ -192,12 +212,16 @@ check_entry() {
     fail_closed "备份内容是 Guard shim 而不是原始入口，拒绝用它覆盖: $backup"
   fi
   backup_sha="$(sha256_file "$backup")" || exit 14
-  if [ "$backup_sha" != "$(manifest_entry_field "$MANIFEST" "$name" original.sha256)" ]; then
+  if [ "$backup_sha" != "$(manifest_entry_field "$CANDIDATE" "$name" original.sha256)" ]; then
     fail_closed "备份内容与安装时记录的摘要不符: $backup"
   fi
+  # mode 的格式已由 validate_manifest 把住，这里再确认它对 chmod 确实可用——第二遍
+  # 里一个失败的 chmod 就会留下「恢复一半」，那是文档明确承诺不会出现的状态。
+  chmod "$(manifest_entry_field "$CANDIDATE" "$name" original.mode)" "$backup" ||
+    fail_closed "安装记录里的 original.mode 无法应用: $name"
 }
 
-names="$(jq -r '.entries[].name' "$MANIFEST")"
+names="$(jq -r '.entries[].name' "$CANDIDATE")"
 while IFS= read -r name; do
   [ -n "$name" ] || continue
   check_entry "$name"
@@ -219,8 +243,8 @@ restore_entry() {
   local name="$1"
   local path state target backup mode
 
-  path="$(manifest_entry_field "$MANIFEST" "$name" path)"
-  state="$(manifest_entry_field "$MANIFEST" "$name" original.state)"
+  path="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" path)"
+  state="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.state)"
 
   case "$state" in
     absent)
@@ -229,7 +253,7 @@ restore_entry() {
       printf '已移除: %s\n' "$path"
       ;;
     symlink|dangling-symlink)
-      target="$(manifest_entry_field "$MANIFEST" "$name" original.symlink_target)"
+      target="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.symlink_target)"
       if act "把 $path 恢复为指向 $target 的 symlink"; then return 0; fi
       rm -f "$path"
       # 必须用 ln -s 重建。当初就是因为 cp -p 会把 symlink 展平成普通文件，才改成
@@ -238,8 +262,8 @@ restore_entry() {
       printf '已恢复 symlink: %s -> %s\n' "$path" "$target"
       ;;
     file)
-      backup="$(manifest_entry_field "$MANIFEST" "$name" original.backup_path)"
-      mode="$(manifest_entry_field "$MANIFEST" "$name" original.mode)"
+      backup="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.backup_path)"
+      mode="$(manifest_entry_field "$ACTIVE_MANIFEST" "$name" original.mode)"
       # ${path} 的花括号不能省：bash 3.2 会把紧随其后的全角字符的首字节吞进变量名，
       # 于是 set -u 报 "path?: unbound variable"。bash 5 下没有这个问题。
       if act "用 $backup 恢复 ${path}（权限 ${mode}）"; then return 0; fi
@@ -257,6 +281,13 @@ restore_entry() {
       ;;
   esac
 }
+
+# 全部校验通过，这里是唯一的提交点。dry-run 不提交，候选由 EXIT trap 清掉。
+if [ "$DRY_RUN" -eq 0 ]; then
+  mv "$CANDIDATE" "$MANIFEST" || fail_closed "无法提交安装记录: $MANIFEST"
+  trap - EXIT
+  ACTIVE_MANIFEST="$MANIFEST"
+fi
 
 printf '前缀: %s\n' "$PREFIX"
 while IFS= read -r name; do
