@@ -76,6 +76,54 @@ canonical_path() {
   esac
 }
 
+# 两个路径是否同一个文件。字符串归一挡得住 ../ 这类别名，挡不住大小写别名：macOS 默认
+# 的 APFS 大小写不敏感，CLAUDE 与 claude 是同一个目录项。-ef 比较 device/inode，
+# bash 3.2 可用；两端都存在时才有意义。
+same_file() {
+  [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
+}
+
+# 跨记录的备份所有权冲突：某条记录把路径标成 managed（卸载完会删），另一条把同一个
+# 文件标成 adopted（承诺永不删）。单看每条都合法，合起来就把承诺打破。
+#
+# 判定顺序：字符串归一相等，或两端都存在且 -ef 为真。归一只发生在比较中，既不写回
+# manifest 也不改安装产物——把 PREFIX 归一会让 macOS 上的 /var 变成 /private/var，
+# 用户路径若是软链，shim 里就会硬写物理路径。
+#
+# 本函数只输出诊断并返回非零，由调用方决定退出方式：安装器与卸载器都要在改任何
+# artifact 之前调用它，不能只有卸载器一个消费者知道这条不变式。
+check_backup_ownership_conflicts() {
+  local manifest="$1"
+  local name other raw raw_other canon canon_other origin
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ "$(manifest_entry_field "$manifest" "$name" original.state)" = file ] || continue
+    origin="$(manifest_entry_field "$manifest" "$name" original.backup_origin)"
+    [ "$origin" = managed ] || continue
+    raw="$(manifest_entry_field "$manifest" "$name" original.backup_path)"
+    canon="$(canonical_path "$raw" 2>/dev/null || printf '%s\n' "$raw")"
+
+    while IFS= read -r other; do
+      [ -n "$other" ] || continue
+      [ "$other" != "$name" ] || continue
+      [ "$(manifest_entry_field "$manifest" "$other" original.state)" = file ] || continue
+      raw_other="$(manifest_entry_field "$manifest" "$other" original.backup_path)"
+      canon_other="$(canonical_path "$raw_other" 2>/dev/null || printf '%s\n' "$raw_other")"
+      if [ "$canon" = "$canon_other" ] || same_file "$raw" "$raw_other"; then
+        printf '备份路径被多条记录同时声明所有权: %s（managed 属于 %s，%s 也引用了它: %s）\n' \
+          "$raw" "$name" "$other" "$raw_other" >&2
+        return 1
+      fi
+    done <<INNER
+$(jq -r '.entries[].name' "$manifest")
+INNER
+  done <<OUTER
+$(jq -r '.entries[].name' "$manifest")
+OUTER
+  return 0
+}
+
 manifest_path() {
   printf '%s/share/claude-guard/entrypoints.json\n' "$1"
 }
