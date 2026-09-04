@@ -23,6 +23,13 @@ validate_manifest "$MANIFEST" "$BIN_DIR" || {
   printf '请先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
   exit 14
 }
+# 所有权冲突同样是「坏 manifest」的一种，只是 jq 的字符串校验看不见别名；这条不变式
+# 的每个消费者都得检查，不能只有卸载器知道。
+check_backup_ownership_conflicts "$MANIFEST" || {
+  printf '已有的安装记录存在备份所有权冲突，拒绝安装: %s\n' "$MANIFEST" >&2
+  printf '请先运行 scripts/uninstall.sh --inspect 查看现状。\n' >&2
+  exit 14
+}
 
 # 先记录再覆盖，理由同 install-entrypoint-shims.sh。claude-cc 装的是真正的
 # launcher 而不是 shim，因此 artifact 记为 binary。

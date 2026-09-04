@@ -581,4 +581,57 @@ fi
 [ "$(sha256_file "$(manifest_file)")" = "$before_32_manifest" ] ||
   fail '用例 32: 拒绝之后 manifest 被改写'
 
+# --- 33. macOS 大小写别名不得绕过所有权校验 ---
+# APFS 默认大小写不敏感，CLAUDE-OFFICIAL.CLAUDE-GUARD-BACKUP 与小写是同一个目录项，
+# 字符串归一认不出来，只有 -ef 认得出来。先断言两个名字确实是同一个文件，否则在大小写
+# 敏感卷（Linux CI）上它们是两个不同文件，这条用例根本不成立，跳过而不是假绿。
+new_prefix
+printf '#!/bin/sh\necho REAL-C\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-O\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
+do_install
+managed_33="$PREFIX/bin/claude-official.claude-guard-backup"
+alias_33="$PREFIX/bin/CLAUDE-OFFICIAL.CLAUDE-GUARD-BACKUP"
+if [ "$managed_33" -ef "$alias_33" ]; then
+  before_33="$(snapshot "$PREFIX/bin")"
+  before_33_manifest="$(sha256_file "$(manifest_file)")"
+  if do_uninstall --adopt-backup "claude=$alias_33"; then
+    fail '用例 33: 大小写别名绕过了所有权校验'
+  fi
+  [ -e "$managed_33" ] || fail '用例 33: 别名被放行，共享备份已被删除'
+  [ "$before_33" = "$(snapshot "$PREFIX/bin")" ] || fail '用例 33: 拒绝之后入口仍被改动'
+  [ "$(sha256_file "$(manifest_file)")" = "$before_33_manifest" ] ||
+    fail '用例 33: 拒绝之后 manifest 被改写'
+else
+  printf '用例 33: 当前卷大小写敏感，别名不是同一文件，跳过\n'
+fi
+
+# --- 34. 三个安装器都必须拒绝带所有权冲突的 manifest ---
+# 所有权不变式的消费者不止卸载器：预置一份单条合法、合起来冲突（../ 别名）的 manifest，
+# 三个安装器在改任何 artifact 之前都必须 exit 14，入口与 manifest 逐项不变。
+new_prefix
+printf '#!/bin/sh\necho REAL-C\n' >"$PREFIX/bin/claude"
+printf '#!/bin/sh\necho REAL-O\n' >"$PREFIX/bin/claude-official"
+chmod 0755 "$PREFIX/bin/claude" "$PREFIX/bin/claude-official"
+do_install
+jq --arg p "$PREFIX/bin/../bin/claude-official.claude-guard-backup" \
+  '.entries |= map(if .name == "claude"
+     then .original.backup_path = $p | .original.backup_origin = "adopted"
+     else . end)' "$(manifest_file)" >"$TMP_DIR/m34" && mv "$TMP_DIR/m34" "$(manifest_file)"
+before_34="$(snapshot "$PREFIX/bin")"
+before_34_manifest="$(sha256_file "$(manifest_file)")"
+for installer in install.sh install-cc-entrypoint.sh install-entrypoint-shims.sh; do
+  set +e
+  CLAUDE_GUARD_PREFIX="$PREFIX" "$ROOT_DIR/scripts/$installer" >"$PREFIX/install.out" 2>&1
+  status=$?
+  set -e
+  [ "$status" -eq 14 ] ||
+    fail "用例 34: $installer 在冲突 manifest 下应 exit 14，实际 ${status}" "$PREFIX/install.out"
+  [ "$before_34" = "$(snapshot "$PREFIX/bin")" ] || fail "用例 34: $installer 改动了入口"
+  [ "$(sha256_file "$(manifest_file)")" = "$before_34_manifest" ] ||
+    fail "用例 34: $installer 改写了 manifest"
+  grep -q '所有权冲突' "$PREFIX/install.out" ||
+    fail "用例 34: $installer 未报出所有权冲突" "$PREFIX/install.out"
+done
+
 printf 'entrypoint lifecycle ok\n'
